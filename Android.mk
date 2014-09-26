@@ -1,6 +1,7 @@
 LOCAL_PATH := $(call my-dir)
 
 include $(CLEAR_VARS)
+LOCAL_ADDITIONAL_DEPENDENCIES := $(LOCAL_PATH)/Android.mk
 
 LOCAL_SRC_FILES := \
 	src/main.cc \
@@ -15,18 +16,12 @@ LOCAL_SRC_FILES := \
 	src/queue.cc \
 	src/sat.cc \
 	src/sat_factory.cc \
-	src/worker.cc
+	src/worker.cc \
+
 LOCAL_MODULE:= stressapptest
 LOCAL_MODULE_TAGS := optional
-
 LOCAL_CFLAGS := -DHAVE_CONFIG_H -DANDROID -DNDEBUG -UDEBUG -DCHECKOPTS
-
-LOCAL_C_INCLUDES := \
-	bionic \
-	external/stlport/stlport
-
 LOCAL_CPP_EXTENSION := .cc
-
-LOCAL_SHARED_LIBRARIES := libc libstlport
+LOCAL_CXX_STL := stlport
 
 include $(BUILD_EXECUTABLE)
