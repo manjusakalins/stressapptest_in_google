@@ -57,6 +57,9 @@
 /* Define to 1 if you have the <pthread.h> header file. */
 #define HAVE_PTHREAD_H 1
 
+/* Android, why do you define _POSIX_BARRIERS when you have no _POSIX_BARRIERS?! */
+#undef _POSIX_BARRIERS
+
 /* Define to 1 if you have the `rand_r' function. */
 /* #undef HAVE_RAND_R */
 
