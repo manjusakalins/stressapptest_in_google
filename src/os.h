@@ -17,6 +17,9 @@
 #define STRESSAPPTEST_OS_H_
 
 #include <dirent.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+
 #include <string>
 #include <list>
 #include <map>
@@ -26,8 +29,9 @@
 // so these includes are correct.
 #include "adler32memcpy.h"  // NOLINT
 #include "sattypes.h"       // NOLINT
+#include "clock.h"          // NOLINT
 
-const char kSysfsPath[] = "/sys/bus/pci/devices";
+const char kPagemapPath[] = "/proc/self/pagemap";
 
 struct PCIDevice {
   int32 domain;
@@ -44,6 +48,8 @@ typedef vector<PCIDevice*> PCIDevices;
 
 class ErrorDiag;
 
+class Clock;
+
 // This class implements OS/Platform specific funtions.
 class OsLayer {
  public:
@@ -54,6 +60,21 @@ class OsLayer {
   // Must be set before Initialize().
   void SetMinimumHugepagesSize(int64 min_bytes) {
     min_hugepages_bytes_ = min_bytes;
+  }
+
+  // Set the minium amount of memory that should not be allocated. This only
+  // has any affect if hugepages are not used.
+  // Must be set before Initialize().
+  void SetReserveSize(int64 reserve_mb) {
+    reserve_mb_ = reserve_mb;
+  }
+
+  // Set parameters needed to translate physical address to memory module.
+  void SetDramMappingParams(uintptr_t channel_hash, int channel_width,
+                            vector< vector<string> > *channels) {
+    channel_hash_ = channel_hash;
+    channel_width_ = channel_width;
+    channels_ = channels;
   }
 
   // Initializes data strctures and open files.
@@ -68,13 +89,11 @@ class OsLayer {
   // Prints failed dimm. This implementation is optional for
   // subclasses to implement.
   // Takes a bus address and string, and prints the DIMM name
-  // into the string. Returns error status.
+  // into the string. Returns the DIMM number that corresponds to the
+  // address given, or -1 if unable to identify the DIMM number.
+  // Note that subclass implementations of FindDimm() MUST fill
+  // buf with at LEAST one non-whitespace character (provided len > 0).
   virtual int FindDimm(uint64 addr, char *buf, int len);
-  // Print dimm info, plus more available info.
-  virtual int FindDimmExtended(uint64 addr, char *buf, int len) {
-    return FindDimm(addr, buf, len);
-  }
-
 
   // Classifies addresses according to "regions"
   // This may mean different things on different platforms.
@@ -132,10 +151,94 @@ class OsLayer {
     // instruction. For example, software can use an MFENCE instruction to
     // insure that previous stores are included in the write-back.
     asm volatile("mfence");
-    asm volatile("clflush (%0)" :: "r" (vaddr));
+    asm volatile("clflush (%0)" : : "r" (vaddr));
+    asm volatile("mfence");
+#elif defined(STRESSAPPTEST_CPU_ARMV7A) && !defined(__aarch64__)
+    // ARMv7a cachelines are 8 words (32 bytes).
+    syscall(__ARM_NR_cacheflush, vaddr, reinterpret_cast<char*>(vaddr) + 32, 0);
+#else
+  #warning "Unsupported CPU type: Unable to force cache flushes."
+#endif
+  }
+
+  // Fast flush, for use in performance critical code.
+  // This is bound at compile time, and will not pick up
+  // any runtime machine configuration info.  Takes a NULL-terminated
+  // array of addresses to flush.
+  inline static void FastFlushList(void **vaddrs) {
+#ifdef STRESSAPPTEST_CPU_PPC
+    while (*vaddrs) {
+      asm volatile("dcbf 0,%0" : : "r" (*vaddrs++));
+    }
+    asm volatile("sync");
+#elif defined(STRESSAPPTEST_CPU_X86_64) || defined(STRESSAPPTEST_CPU_I686)
+    // Put mfence before and after clflush to make sure:
+    // 1. The write before the clflush is committed to memory bus;
+    // 2. The read after the clflush is hitting the memory bus.
+    //
+    // From Intel manual:
+    // CLFLUSH is only ordered by the MFENCE instruction. It is not guaranteed
+    // to be ordered by any other fencing, serializing or other CLFLUSH
+    // instruction. For example, software can use an MFENCE instruction to
+    // insure that previous stores are included in the write-back.
+    asm volatile("mfence");
+    while (*vaddrs) {
+      asm volatile("clflush (%0)" : : "r" (*vaddrs++));
+    }
     asm volatile("mfence");
 #elif defined(STRESSAPPTEST_CPU_ARMV7A)
-  #warning "Unsupported CPU type ARMV7A: Unable to force cache flushes."
+    while (*vaddrs) {
+      FastFlush(*vaddrs++);
+    }
+#else
+    #warning "Unsupported CPU type: Unable to force cache flushes."
+#endif
+  }
+
+  // Fast flush hint, for use in performance critical code.
+  // This is bound at compile time, and will not pick up
+  // any runtime machine configuration info.  Note that this
+  // will not guarantee that a flush happens, but will at least
+  // hint that it should.  This is useful for speeding up
+  // parallel march algorithms.
+  inline static void FastFlushHint(void *vaddr) {
+#ifdef STRESSAPPTEST_CPU_PPC
+    asm volatile("dcbf 0,%0" : : "r" (vaddr));
+#elif defined(STRESSAPPTEST_CPU_X86_64) || defined(STRESSAPPTEST_CPU_I686)
+    // From Intel manual:
+    // CLFLUSH is only ordered by the MFENCE instruction. It is not guaranteed
+    // to be ordered by any other fencing, serializing or other CLFLUSH
+    // instruction. For example, software can use an MFENCE instruction to
+    // insure that previous stores are included in the write-back.
+    asm volatile("clflush (%0)" : : "r" (vaddr));
+#elif defined(STRESSAPPTEST_CPU_ARMV7A)
+    FastFlush(vaddr);
+#else
+    #warning "Unsupported CPU type: Unable to force cache flushes."
+#endif
+  }
+
+  // Fast flush, for use in performance critical code.
+  // This is bound at compile time, and will not pick up
+  // any runtime machine configuration info.  Sync's any
+  // transactions for ordering FastFlushHints.
+  inline static void FastFlushSync() {
+#ifdef STRESSAPPTEST_CPU_PPC
+    asm volatile("sync");
+#elif defined(STRESSAPPTEST_CPU_X86_64) || defined(STRESSAPPTEST_CPU_I686)
+    // Put mfence before and after clflush to make sure:
+    // 1. The write before the clflush is committed to memory bus;
+    // 2. The read after the clflush is hitting the memory bus.
+    //
+    // From Intel manual:
+    // CLFLUSH is only ordered by the MFENCE instruction. It is not guaranteed
+    // to be ordered by any other fencing, serializing or other CLFLUSH
+    // instruction. For example, software can use an MFENCE instruction to
+    // insure that previous stores are included in the write-back.
+    asm volatile("mfence");
+#elif defined(STRESSAPPTEST_CPU_ARMV7A)
+    // This is a NOP, FastFlushHint() always does a full flush, so there's
+    // nothing to do for FastFlushSync().
 #else
   #warning "Unsupported CPU type: Unable to force cache flushes."
 #endif
@@ -164,10 +267,10 @@ class OsLayer {
     __asm __volatile("rdtsc" : "=a" (data.l32.l), "=d"(data.l32.h));
     tsc = data.l64;
 #elif defined(STRESSAPPTEST_CPU_ARMV7A)
-  #warning "Unsupported CPU type ARMV7A: your build may not function correctly"
+    #warning "Unsupported CPU type ARMV7A: your timer may not function correctly"
     tsc = 0;
 #else
-  #warning "Unsupported CPU type: your build may not function correctly"
+    #warning "Unsupported CPU type: your timer may not function correctly"
     tsc = 0;
 #endif
     return (tsc);
@@ -230,9 +333,6 @@ class OsLayer {
   // Handle to platform-specific error diagnoser.
   ErrorDiag *error_diagnoser_;
 
-  // Detect all PCI Devices.
-  virtual PCIDevices GetPCIDevices();
-
   // Disambiguate between different "warm" memcopies.
   virtual bool AdlerMemcpyWarm(uint64 *dstmem, uint64 *srcmem,
                                unsigned int size_in_bytes,
@@ -249,17 +349,31 @@ class OsLayer {
   }
   ErrCallback get_err_log_callback() { return err_log_callback_; }
 
+  // Set a clock object that can be overridden for use with unit tests.
+  void SetClock(Clock *clock) {
+    if (clock_) {
+      delete clock_;
+    }
+    clock_ = clock;
+    time_initialized_ = clock_->Now();
+  }
+
  protected:
   void *testmem_;                // Location of test memory.
   uint64 testmemsize_;           // Size of test memory.
   int64 totalmemsize_;           // Size of available memory.
   int64 min_hugepages_bytes_;    // Minimum hugepages size.
+  int64 reserve_mb_;             // Minimum amount of memory to reserve in MB.
   bool  error_injection_;        // Do error injection?
   bool  normal_mem_;             // Memory DMA capable?
   bool  use_hugepages_;          // Use hugepage shmem?
   bool  use_posix_shm_;          // Use 4k page shmem?
   bool  dynamic_mapped_shmem_;   // Conserve virtual address space.
+  bool  mmapped_allocation_;     // Was memory allocated using mmap()?
   int   shmid_;                  // Handle to shmem
+  vector< vector<string> > *channels_;  // Memory module names per channel.
+  uint64 channel_hash_;          // Mask of address bits XORed for channel.
+  int channel_width_;            // Channel width in bits.
 
   int64 regionsize_;             // Size of memory "regions"
   int   regioncount_;            // Number of memory "regions"
@@ -267,7 +381,7 @@ class OsLayer {
   int   num_nodes_;              // Number of nodes in the system.
   int   num_cpus_per_node_;      // Number of cpus per node in the system.
   int   address_mode_;           // Are we running 32 or 64 bit?
-  bool  has_sse2_;               // Do we have sse2 instructions?
+  bool  has_vector_;             // Do we have sse2/neon instructions?
   bool  has_clflush_;            // Do we have clflush instructions?
   bool  use_flush_page_cache_;   // Do we need to flush the page cache?
 
@@ -279,15 +393,15 @@ class OsLayer {
 
   // Get file descriptor for dev msr.
   virtual int OpenMSR(uint32 core, uint32 address);
-  // Auxiliary methods for PCI device configuration
-  int PCIGetValue(string name, string object);
-  int PCIGetResources(string name, PCIDevice *device);
 
   // Look up how many hugepages there are.
   virtual int64 FindHugePages();
 
   // Link to find last transaction at an error location.
   ErrCallback err_log_callback_;
+
+  // Object to wrap the time function.
+  Clock *clock_;
 
  private:
   DISALLOW_COPY_AND_ASSIGN(OsLayer);

@@ -48,6 +48,7 @@
 // so these includes are correct.
 #include "sattypes.h"
 #include "error_diag.h"
+#include "clock.h"
 
 // OsLayer initialization.
 OsLayer::OsLayer() {
@@ -55,10 +56,12 @@ OsLayer::OsLayer() {
   testmemsize_ = 0;
   totalmemsize_ = 0;
   min_hugepages_bytes_ = 0;
+  reserve_mb_ = 0;
   normal_mem_ = true;
   use_hugepages_ = false;
   use_posix_shm_ = false;
   dynamic_mapped_shmem_ = false;
+  mmapped_allocation_ = false;
   shmid_ = 0;
 
   time_initialized_ = 0;
@@ -76,20 +79,28 @@ OsLayer::OsLayer() {
   address_mode_ = sizeof(pvoid) * 8;
 
   has_clflush_ = false;
-  has_sse2_ = false;
+  has_vector_ = false;
 
   use_flush_page_cache_ = false;
+
+  clock_ = NULL;
 }
 
 // OsLayer cleanup.
 OsLayer::~OsLayer() {
   if (error_diagnoser_)
     delete error_diagnoser_;
+  if (clock_)
+    delete clock_;
 }
 
 // OsLayer initialization.
 bool OsLayer::Initialize() {
-  time_initialized_ = time(NULL);
+  if (!clock_) {
+    clock_ = new Clock();
+  }
+
+  time_initialized_ = clock_->Now();
   // Detect asm support.
   GetFeatures();
 
@@ -129,8 +140,28 @@ int OsLayer::AddressMode() {
 
 // Translates user virtual to physical address.
 uint64 OsLayer::VirtualToPhysical(void *vaddr) {
-  // Needs platform specific implementation.
-  return 0;
+  uint64 frame, shift;
+  off64_t off = ((uintptr_t)vaddr) / sysconf(_SC_PAGESIZE) * 8;
+  int fd = open(kPagemapPath, O_RDONLY);
+  // /proc/self/pagemap is available in kernel >= 2.6.25
+  if (fd < 0)
+    return 0;
+
+  if (lseek64(fd, off, SEEK_SET) != off || read(fd, &frame, 8) != 8) {
+    int err = errno;
+    string errtxt = ErrorString(err);
+    logprintf(0, "Process Error: failed to access %s with errno %d (%s)\n",
+              kPagemapPath, err, errtxt.c_str());
+    if (fd >= 0)
+      close(fd);
+    return 0;
+  }
+  close(fd);
+  if (!(frame & (1LL << 63)) || (frame & (1LL << 62)))
+    return 0;
+  shift = (frame >> 55) & 0x3f;
+  frame = (frame & 0x007fffffffffffffLL) << shift;
+  return frame | ((uintptr_t)vaddr & ((1LL << shift) - 1));
 }
 
 // Returns the HD device that contains this file.
@@ -149,21 +180,21 @@ list<string> OsLayer::FindFileDevices() {
 // Get HW core features from cpuid instruction.
 void OsLayer::GetFeatures() {
 #if defined(STRESSAPPTEST_CPU_X86_64) || defined(STRESSAPPTEST_CPU_I686)
-  // CPUID features documented at:
-  // http://www.sandpile.org/ia32/cpuid.htm
-  int ax, bx, cx, dx;
-  __asm__ __volatile__ (
-      "cpuid": "=a" (ax), "=b" (bx), "=c" (cx), "=d" (dx) : "a" (1));
-  has_clflush_ = (dx >> 19) & 1;
-  has_sse2_ = (dx >> 26) & 1;
+  unsigned int eax = 1, ebx, ecx, edx;
+  cpuid(&eax, &ebx, &ecx, &edx);
+  has_clflush_ = (edx >> 19) & 1;
+  has_vector_ = (edx >> 26) & 1;  // SSE2 caps bit.
 
   logprintf(9, "Log: has clflush: %s, has sse2: %s\n",
             has_clflush_ ? "true" : "false",
-            has_sse2_ ? "true" : "false");
+            has_vector_ ? "true" : "false");
 #elif defined(STRESSAPPTEST_CPU_PPC)
   // All PPC implementations have cache flush instructions.
   has_clflush_ = true;
 #elif defined(STRESSAPPTEST_CPU_ARMV7A)
+  // TODO(nsanders): add detect from /proc/cpuinfo or /proc/self/auxv.
+  // For now assume neon and don't run -W if you don't have it.
+  has_vector_ = true; // NEON.
 #warning "Unsupported CPU type ARMV7A: unable to determine feature set."
 #else
 #warning "Unsupported CPU type: unable to determine feature set."
@@ -215,8 +246,9 @@ bool OsLayer::FlushPageCache(void) {
 void OsLayer::Flush(void *vaddr) {
   // Use the generic flush. This function is just so we can override
   // this if we are so inclined.
-  if (has_clflush_)
-    FastFlush(vaddr);
+  if (has_clflush_) {
+    OsLayer::FastFlush(vaddr);
+  }
 }
 
 
@@ -224,7 +256,7 @@ void OsLayer::Flush(void *vaddr) {
 bool OsLayer::AdlerMemcpyWarm(uint64 *dstmem, uint64 *srcmem,
                               unsigned int size_in_bytes,
                               AdlerChecksum *checksum) {
-  if (has_sse2_) {
+  if (has_vector_) {
     return AdlerMemcpyAsm(dstmem, srcmem, size_in_bytes, checksum);
   } else {
     return AdlerMemcpyWarmC(dstmem, srcmem, size_in_bytes, checksum);
@@ -232,12 +264,31 @@ bool OsLayer::AdlerMemcpyWarm(uint64 *dstmem, uint64 *srcmem,
 }
 
 
-// Translate user virtual to physical address.
+// Translate physical address to memory module/chip name.
+// Assumes interleaving between two memory channels based on the XOR of
+// all address bits in the 'channel_hash' mask, with repeated 'channel_width_'
+// blocks with bits distributed from each chip in that channel.
 int OsLayer::FindDimm(uint64 addr, char *buf, int len) {
-  char tmpbuf[256];
-  snprintf(tmpbuf, sizeof(tmpbuf), "DIMM Unknown");
-  snprintf(buf, len, "%s", tmpbuf);
-  return 0;
+  if (!channels_) {
+    snprintf(buf, len, "DIMM Unknown");
+    return -1;
+  }
+
+  // Find channel by XORing address bits in channel_hash mask.
+  uint32 low = static_cast<uint32>(addr & channel_hash_);
+  uint32 high = static_cast<uint32>((addr & channel_hash_) >> 32);
+  vector<string>& channel = (*channels_)[
+      __builtin_parity(high) ^ __builtin_parity(low)];
+
+  // Find dram chip by finding which byte within the channel
+  // by address mod channel width, then divide the channel
+  // evenly among the listed dram chips. Note, this will not work
+  // with x4 dram.
+  int chip = (addr % (channel_width_ / 8)) /
+             ((channel_width_ / 8) / channel.size());
+  string name = channel[chip];
+  snprintf(buf, len, "%s", name.c_str());
+  return 1;
 }
 
 
@@ -293,9 +344,17 @@ string OsLayer::FindCoreMaskFormat(int32 region) {
 
 // Report an error in an easily parseable way.
 bool OsLayer::ErrorReport(const char *part, const char *symptom, int count) {
-  time_t now = time(NULL);
+  time_t now = clock_->Now();
   int ttf = now - time_initialized_;
-  logprintf(0, "Report Error: %s : %s : %d : %ds\n", symptom, part, count, ttf);
+  if (strlen(symptom) && strlen(part)) {
+    logprintf(0, "Report Error: %s : %s : %d : %ds\n",
+              symptom, part, count, ttf);
+  } else {
+    // Log something so the error still shows up, but this won't break the
+    // parser.
+    logprintf(0, "Warning: Invalid Report Error: "
+              "%s : %s : %d : %ds\n", symptom, part, count, ttf);
+  }
   return true;
 }
 
@@ -359,12 +418,31 @@ int64 OsLayer::FindFreeMemSize() {
   //
   // TODO(nsanders): is there a more correct way to determine target
   // memory size?
-  if (hugepagesize > 0 && min_hugepages_bytes_ > 0) {
-    minsize = min_hugepages_bytes_;
-  } else if (physsize < 2048LL * kMegabyte) {
-    minsize = ((pages * 85) / 100) * pagesize;
+  if (hugepagesize > 0) {
+    if (min_hugepages_bytes_ > 0) {
+      minsize = min_hugepages_bytes_;
+    } else {
+      minsize = hugepagesize;
+    }
   } else {
-    minsize = ((pages * 95) / 100) * pagesize - (192 * kMegabyte);
+    if (physsize < 2048LL * kMegabyte) {
+      minsize = ((pages * 85) / 100) * pagesize;
+    } else {
+      minsize = ((pages * 95) / 100) * pagesize - (192 * kMegabyte);
+    }
+    // Make sure that at least reserve_mb_ is left for the system.
+    if (reserve_mb_ > 0) {
+      int64 totalsize = pages * pagesize;
+      int64 reserve_kb = reserve_mb_ * kMegabyte;
+      if (reserve_kb > totalsize) {
+        logprintf(0, "Procedural Error: %lld is bigger than the total memory "
+                  "available %lld\n", reserve_kb, totalsize);
+      } else if (reserve_kb > totalsize - minsize) {
+        logprintf(5, "Warning: Overriding memory to use: original %lld, "
+                  "current %lld\n", minsize, totalsize - reserve_kb);
+        minsize = totalsize - reserve_kb;
+      }
+    }
   }
 
   // Use hugepage sizing if available.
@@ -435,7 +513,7 @@ bool OsLayer::AllocateTestMem(int64 length, uint64 paddr_base) {
                  "'sudo mount -o remount,size=100\% /dev/shm.'\n");
   } else if (hugepagesize >= length) {
     prefer_hugepages = true;
-    logprintf(3, "Log: Prefer using hugepace allocation.\n");
+    logprintf(3, "Log: Prefer using hugepage allocation.\n");
   } else {
     logprintf(3, "Log: Prefer plain malloc memory allocation.\n");
   }
@@ -458,7 +536,7 @@ bool OsLayer::AllocateTestMem(int64 length, uint64 paddr_base) {
         break;
       }
 
-      shmaddr = shmat(shmid, NULL, NULL);
+      shmaddr = shmat(shmid, NULL, 0);
       if (shmaddr == reinterpret_cast<void*>(-1)) {
         int err = errno;
         string errtxt = ErrorString(err);
@@ -515,7 +593,7 @@ bool OsLayer::AllocateTestMem(int64 length, uint64 paddr_base) {
         // Do a full mapping here otherwise.
         shmaddr = mmap64(NULL, length, PROT_READ | PROT_WRITE,
                          MAP_SHARED | MAP_NORESERVE | MAP_LOCKED | MAP_POPULATE,
-                         shm_object, NULL);
+                         shm_object, 0);
         if (shmaddr == reinterpret_cast<void*>(-1)) {
           int err = errno;
           string errtxt = ErrorString(err);
@@ -540,18 +618,32 @@ bool OsLayer::AllocateTestMem(int64 length, uint64 paddr_base) {
     } while (0);
     shm_unlink("/stressapptest");
   }
-#endif // HAVE_SYS_SHM_H
+#endif  // HAVE_SYS_SHM_H
 
   if (!use_hugepages_ && !use_posix_shm_) {
-    // Use memalign to ensure that blocks are aligned enough for disk direct IO.
-    buf = static_cast<char*>(memalign(4096, length));
-    if (buf) {
-      logprintf(0, "Log: Using memaligned allocation at %p.\n", buf);
-    } else {
-      logprintf(0, "Process Error: memalign returned 0\n");
-      if ((length >= 1499LL * kMegabyte) && (address_mode_ == 32)) {
-        logprintf(0, "Log: You are trying to allocate > 1.4G on a 32 "
-                     "bit process. Please setup shared memory.\n");
+    // If the page size is what SAT is expecting explicitly perform mmap()
+    // allocation.
+    if (sysconf(_SC_PAGESIZE) >= 4096) {
+      void *map_buf = mmap(NULL, length, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      if (map_buf != MAP_FAILED) {
+        buf = map_buf;
+        mmapped_allocation_ = true;
+        logprintf(0, "Log: Using mmap() allocation at %p.\n", buf);
+      }
+    }
+    if (!mmapped_allocation_) {
+      // Use memalign to ensure that blocks are aligned enough for disk direct
+      // IO.
+      buf = static_cast<char*>(memalign(4096, length));
+      if (buf) {
+        logprintf(0, "Log: Using memaligned allocation at %p.\n", buf);
+      } else {
+        logprintf(0, "Process Error: memalign returned 0\n");
+        if ((length >= 1499LL * kMegabyte) && (address_mode_ == 32)) {
+          logprintf(0, "Log: You are trying to allocate > 1.4G on a 32 "
+                       "bit process. Please setup shared memory.\n");
+        }
       }
     }
   }
@@ -579,6 +671,8 @@ void OsLayer::FreeTestMem() {
         munmap(testmem_, testmemsize_);
       }
       close(shmid_);
+    } else if (mmapped_allocation_) {
+      munmap(testmem_, testmemsize_);
     } else {
       free(testmem_);
     }
@@ -800,7 +894,9 @@ uint32 OsLayer::GetBitField(uint32 val, uint32 n, uint32 len) {
 bool OsLayer::CpuStressWorkload() {
   double float_arr[100];
   double sum = 0;
+#ifdef HAVE_RAND_R
   unsigned int seed = 12345;
+#endif
 
   // Initialize array with random numbers.
   for (int i = 0; i < 100; i++) {
@@ -809,8 +905,9 @@ bool OsLayer::CpuStressWorkload() {
     if (rand_r(&seed) % 2)
       float_arr[i] *= -1.0;
 #else
-    float_arr[i] = rand();
-    if (rand() % 2)
+    srand(time(NULL));
+    float_arr[i] = rand();  // NOLINT
+    if (rand() % 2)         // NOLINT
       float_arr[i] *= -1.0;
 #endif
   }
@@ -827,83 +924,4 @@ bool OsLayer::CpuStressWorkload() {
   if (sum == 0.0)
     logprintf(12, "Log: I'm Feeling Lucky!\n");
   return true;
-}
-
-PCIDevices OsLayer::GetPCIDevices() {
-  PCIDevices device_list;
-  DIR *dir;
-  struct dirent *buf = new struct dirent();
-  struct dirent *entry;
-  dir = opendir(kSysfsPath);
-  if (!dir)
-    logprintf(0, "Process Error: Cannot open %s", kSysfsPath);
-  while (readdir_r(dir, buf, &entry) == 0 && entry) {
-    PCIDevice *device;
-    unsigned int dev, func;
-    // ".", ".." or a special non-device perhaps.
-    if (entry->d_name[0] == '.')
-      continue;
-
-    device = new PCIDevice();
-    if (sscanf(entry->d_name, "%04x:%02hx:%02x.%d",
-               &device->domain, &device->bus, &dev, &func) < 4) {
-      logprintf(0, "Process Error: Couldn't parse %s", entry->d_name);
-      free(device);
-      continue;
-    }
-    device->dev = dev;
-    device->func = func;
-    device->vendor_id = PCIGetValue(entry->d_name, "vendor");
-    device->device_id = PCIGetValue(entry->d_name, "device");
-    PCIGetResources(entry->d_name, device);
-    device_list.insert(device_list.end(), device);
-  }
-  closedir(dir);
-  delete buf;
-  return device_list;
-}
-
-int OsLayer::PCIGetValue(string name, string object) {
-  int fd, len;
-  char filename[256];
-  char buf[256];
-  snprintf(filename, sizeof(filename), "%s/%s/%s", kSysfsPath,
-           name.c_str(), object.c_str());
-  fd = open(filename, O_RDONLY);
-  if (fd < 0)
-    return 0;
-  len = read(fd, buf, 256);
-  close(fd);
-  buf[len] = '\0';
-  return strtol(buf, NULL, 0);  // NOLINT
-}
-
-int OsLayer::PCIGetResources(string name, PCIDevice *device) {
-  char filename[256];
-  char buf[256];
-  FILE *file;
-  int64 start;
-  int64 end;
-  int64 size;
-  int i;
-  snprintf(filename, sizeof(filename), "%s/%s/%s", kSysfsPath,
-           name.c_str(), "resource");
-  file = fopen(filename, "r");
-  if (!file) {
-    logprintf(0, "Process Error: impossible to find resource file for %s",
-              filename);
-    return errno;
-  }
-  for (i = 0; i < 6; i++) {
-    if (!fgets(buf, 256, file))
-      break;
-    sscanf(buf, "%llx %llx", &start, &end);  // NOLINT
-    size = 0;
-    if (start)
-      size = end - start + 1;
-    device->base_addr[i] = start;
-    device->size[i] = size;
-  }
-  fclose(file);
-  return 0;
 }
