@@ -52,7 +52,7 @@
 #define HAVE_NETDB_H 1
 
 /* Define to 1 if you have the `posix_memalign' function. */
-/* #undef HAVE_POSIX_MEMALIGN */
+#define HAVE_POSIX_MEMALIGN 1
 
 /* Define to 1 if the system has `pthread_barrier'. */
 #undef HAVE_PTHREAD_BARRIERS

@@ -18,16 +18,14 @@ LOCAL_SRC_FILES := \
 	src/sat_factory.cc \
 	src/worker.cc
 
-LOCAL_MODULE:= stressapptest
+# just build a 32b version, even on 64b hosts
+LOCAL_MULTILIB := 32
+LOCAL_MODULE := stressapptest
 LOCAL_MODULE_TAGS := optional
+LOCAL_MODULE_UNSUPPORTED_TARGET_ARCH := mips
 
 LOCAL_CFLAGS := -DHAVE_CONFIG_H -DANDROID -DNDEBUG -UDEBUG -DCHECKOPTS
 
-LOCAL_C_INCLUDES := \
-	bionic  \
-	libc++
-
 LOCAL_CPP_EXTENSION := .cc
-LOCAL_CXX_STL := libc++
 
 include $(BUILD_EXECUTABLE)
